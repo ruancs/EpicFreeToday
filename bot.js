@@ -11,12 +11,11 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const API = process.env.TELEGRAM_API_BASE ?? 'https://api.telegram.org';
-const CHAT_IDS = (process.env.TELEGRAM_CHAT_ID ?? '')
-  .split(',')
-  .map((id) => id.trim())
-  .filter(Boolean);
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE ?? '0 10 * * *';
 const HISTORY_FILE = process.env.HISTORY_FILE ?? join(import.meta.dirname, 'data', 'history.json');
+const SUBSCRIBERS_FILE =
+  process.env.SUBSCRIBERS_FILE ?? join(import.meta.dirname, 'data', 'subscribers.json');
+const HOJE_CACHE_MS = 5 * 60 * 1000; // /hoje repetido não precisa bater na Epic toda vez
 const TZ = 'America/Sao_Paulo';
 const LOCALE = 'pt-BR';
 const COUNTRY = 'BR';
@@ -61,35 +60,70 @@ function parseDayArg(arg) {
   return `${year}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
 }
 
-// ---------- histórico (um arquivo JSON, chaveado por dia) ----------
+// ---------- armazenamento (arquivos JSON em data/) ----------
 
-let historyLock = Promise.resolve(); // evita corrida entre o cron e um /hoje simultâneo
+let fileLock = Promise.resolve(); // evita corrida entre o cron e comandos simultâneos
 
-async function loadHistory() {
+async function readJson(file, fallback) {
   try {
-    return JSON.parse(await readFile(HISTORY_FILE, 'utf8'));
+    return JSON.parse(await readFile(file, 'utf8'));
   } catch (error) {
-    if (error.code === 'ENOENT') return {};
+    if (error.code === 'ENOENT') return fallback;
     throw error;
   }
 }
 
-function saveDay(key, games) {
-  const run = historyLock.then(async () => {
-    const history = await loadHistory();
-    history[key] = { fetchedAt: new Date().toISOString(), ...games };
-    await mkdir(dirname(HISTORY_FILE), { recursive: true });
-    const tmp = `${HISTORY_FILE}.tmp`;
-    await writeFile(tmp, JSON.stringify(history, null, 2));
-    await rename(tmp, HISTORY_FILE); // troca atômica: nunca deixa o arquivo pela metade
+/** Lê, aplica `mutate` (devolve o novo valor) e regrava, um de cada vez. */
+function updateJson(file, fallback, mutate) {
+  const run = fileLock.then(async () => {
+    const next = mutate(await readJson(file, fallback));
+    await mkdir(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    await writeFile(tmp, JSON.stringify(next, null, 2));
+    await rename(tmp, file); // troca atômica: nunca deixa o arquivo pela metade
   });
-  historyLock = run.catch(() => {});
+  fileLock = run.catch(() => {});
   return run;
 }
 
-async function refreshToday() {
+// histórico: um registro por dia, chaveado por AAAA-MM-DD
+const loadHistory = () => readJson(HISTORY_FILE, {});
+
+const saveDay = (key, games) =>
+  updateJson(HISTORY_FILE, {}, (history) => ({
+    ...history,
+    [key]: { fetchedAt: new Date().toISOString(), ...games },
+  }));
+
+// inscritos: lista de chat ids que recebem o envio diário
+const loadSubscribers = () => readJson(SUBSCRIBERS_FILE, []);
+
+async function subscribe(chatId) {
+  let added = false;
+  await updateJson(SUBSCRIBERS_FILE, [], (list) => {
+    added = !list.includes(chatId);
+    return added ? [...list, chatId] : list;
+  });
+  return added;
+}
+
+async function unsubscribe(chatId) {
+  let removed = false;
+  await updateJson(SUBSCRIBERS_FILE, [], (list) => {
+    removed = list.includes(chatId);
+    return list.filter((id) => id !== chatId);
+  });
+  return removed;
+}
+
+const todayCache = { key: null, at: 0, games: null };
+
+async function refreshToday({ maxAgeMs = 0 } = {}) {
+  const key = dayKey();
+  if (todayCache.key === key && Date.now() - todayCache.at < maxAgeMs) return todayCache.games;
   const games = await getFreeGames({ locale: LOCALE, country: COUNTRY });
-  await saveDay(dayKey(), games);
+  await saveDay(key, games);
+  Object.assign(todayCache, { key, at: Date.now(), games });
   return games;
 }
 
@@ -153,13 +187,18 @@ async function sendDay(chatId, key, entry) {
 }
 
 async function broadcast(fn) {
-  const targets = CHAT_IDS.length > 0 ? CHAT_IDS : DRY ? ['dry'] : [];
-  if (targets.length === 0) log('TELEGRAM_CHAT_ID vazio: ninguém para receber o envio diário.');
+  const targets = DRY ? ['dry'] : await loadSubscribers();
+  if (targets.length === 0) log('Nenhum inscrito ainda: mande /start ao bot para se cadastrar.');
   for (const chatId of targets) {
     try {
       await fn(chatId);
     } catch (error) {
       log(`falha ao enviar para ${chatId}:`, error.message);
+      // quem bloqueou o bot ou saiu do grupo não deve ficar na lista
+      if (/Forbidden|chat not found/i.test(error.message)) {
+        await unsubscribe(chatId);
+        log(`${chatId} removido dos inscritos`);
+      }
     }
   }
 }
@@ -182,6 +221,7 @@ const HELP = [
   '🎮 <b>Jogos grátis da Epic</b>',
   'Eu mando os jogos grátis todo dia às 10:00 da manhã (Brasília).',
   '',
+  '/stop — parar de receber o envio diário',
   '/hoje — consulta a Epic agora',
   '/historico — dias já registrados',
   '/dia ontem — ou /dia 29/10, /dia 2026-10-29',
@@ -202,18 +242,26 @@ async function showHistory(chatId) {
   return sendText(chatId, '📅 Escolha um dia:', { reply_markup: { inline_keyboard: rows } });
 }
 
-async function handleCommand(chatId, text) {
+async function handleCommand(chatId, text, from) {
   const [rawCommand, ...rest] = text.trim().split(/\s+/);
   const command = rawCommand.toLowerCase().replace(/@.*$/, ''); // /hoje@meubot -> /hoje
   const arg = rest.join(' ');
 
   switch (command) {
-    case '/start':
+    case '/start': {
+      if (await subscribe(chatId)) log(`novo inscrito: ${chatId} (${from?.first_name ?? '?'})`);
+      return sendText(chatId, `✅ Inscrição feita! Você vai receber os jogos grátis todo dia às 10:00.\n\n${HELP}`);
+    }
+    case '/stop': {
+      const removed = await unsubscribe(chatId);
+      if (removed) log(`inscrição cancelada: ${chatId}`);
+      return sendText(chatId, removed ? 'Pronto, você não vai mais receber o envio diário. /start para voltar.' : 'Você não estava inscrito. /start para se inscrever.');
+    }
     case '/ajuda':
     case '/help':
       return sendText(chatId, HELP);
     case '/hoje': {
-      const games = await refreshToday();
+      const games = await refreshToday({ maxAgeMs: HOJE_CACHE_MS });
       return sendDay(chatId, dayKey(), games);
     }
     case '/historico':
@@ -233,20 +281,13 @@ async function handleUpdate(update) {
   const chatId = String(callback?.message?.chat.id ?? update.message?.chat.id ?? '');
   if (!chatId) return;
 
-  // Com TELEGRAM_CHAT_ID preenchido, só esses chats usam o bot.
-  if (CHAT_IDS.length > 0 && !CHAT_IDS.includes(chatId)) {
-    log(`chat ${chatId} ignorado (fora de TELEGRAM_CHAT_ID)`);
-    return;
-  }
-  if (CHAT_IDS.length === 0) log(`mensagem do chat ${chatId} — coloque esse id em TELEGRAM_CHAT_ID`);
-
   try {
     if (callback) {
       await tg('answerCallbackQuery', { callback_query_id: callback.id });
       const key = callback.data?.match(/^day:(\d{4}-\d{2}-\d{2})$/)?.[1];
       if (key) await showDay(chatId, key);
     } else if (update.message?.text?.startsWith('/')) {
-      await handleCommand(chatId, update.message.text);
+      await handleCommand(chatId, update.message.text, update.message.from);
     }
   } catch (error) {
     log('erro ao tratar update:', error.message);
@@ -303,6 +344,8 @@ async function main() {
   await tg('deleteWebhook'); // webhook ativo bloqueia getUpdates
   await tg('setMyCommands', {
     commands: [
+      { command: 'start', description: 'Se inscrever no envio diário' },
+      { command: 'stop', description: 'Cancelar o envio diário' },
       { command: 'hoje', description: 'Consulta a Epic agora' },
       { command: 'historico', description: 'Dias já registrados' },
       { command: 'dia', description: 'Ver um dia: /dia ontem ou /dia 29/10' },
@@ -311,7 +354,8 @@ async function main() {
   });
 
   cron.schedule(CRON_SCHEDULE, dailyJob, { timezone: TZ });
-  log(`Bot @${me.username} no ar. Envio diário: "${CRON_SCHEDULE}" (${TZ}). Destinos: ${CHAT_IDS.join(', ') || '(nenhum)'}`);
+  const subscribers = await loadSubscribers();
+  log(`Bot @${me.username} no ar. Envio diário: "${CRON_SCHEDULE}" (${TZ}). Inscritos: ${subscribers.length}`);
 
   const stop = () => {
     running = false;

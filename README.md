@@ -28,6 +28,8 @@ Cada jogo vai como uma **foto com legenda** (a imagem é a capa oficial da Epic)
 
 | Comando | O que faz |
 | --- | --- |
+| `/start` | Se inscreve no envio diário das 10:00 |
+| `/stop` | Cancela a inscrição |
 | `/hoje` | Consulta a Epic agora e mostra os jogos grátis |
 | `/historico` | Mostra botões com os últimos 14 dias registrados |
 | `/dia ontem` | Mostra os jogos de ontem |
@@ -57,22 +59,17 @@ cp .env.example .env        # no Windows (cmd): copy .env.example .env
 
 Abra o `.env` e preencha `TELEGRAM_BOT_TOKEN` com o token do passo anterior.
 
-### 3. Descubra o seu chat id
+### 3. Suba o bot e se inscreva
 
 ```bash
 npm start
 ```
 
-Mande `/start` para o seu bot. O console vai mostrar uma linha parecida com:
+No Telegram, abra o seu bot e envie `/start`. Pronto: a partir de agora você recebe os jogos grátis todo dia às 10:00.
 
-```
-mensagem do chat 123456789 — coloque esse id em TELEGRAM_CHAT_ID
-```
+**Não há lista de ids para editar.** Qualquer pessoa que enviar `/start` ao bot é cadastrada sozinha e fica salva em `data/subscribers.json`. Quem enviar `/stop` sai da lista, e quem bloquear o bot é removido automaticamente no próximo envio.
 
-Copie esse número para `TELEGRAM_CHAT_ID` no `.env`, pare o bot (`Ctrl+C`) e rode `npm start` de novo.
-A partir daí, **só esse chat** recebe o envio diário e usa o bot.
-
-> Para enviar a mais de um chat, separe os ids por vírgula: `TELEGRAM_CHAT_ID=123456789,987654321`
+> O bot é aberto: quem achar o `@usuario` dele pode se inscrever. Isso é inofensivo (ele só lista jogos grátis), mas se preferir manter o bot só para você e amigos, não divulgue o nome dele.
 
 ## 🧪 Testando
 
@@ -97,9 +94,9 @@ Tudo é configurado pelo arquivo `.env`:
 | Variável | Obrigatória | Descrição |
 | --- | :---: | --- |
 | `TELEGRAM_BOT_TOKEN` | ✅ | Token do bot, criado no @BotFather |
-| `TELEGRAM_CHAT_ID` | recomendada | Ids dos chats (separados por vírgula) que recebem o envio diário e podem usar o bot. Se vazio, o bot responde a qualquer pessoa e não faz o envio diário |
 | `CRON_SCHEDULE` | não | Expressão cron do envio. Padrão: `0 10 * * *` |
 | `HISTORY_FILE` | não | Caminho do arquivo de histórico. Padrão: `data/history.json` |
+| `SUBSCRIBERS_FILE` | não | Caminho do arquivo de inscritos. Padrão: `data/subscribers.json` |
 
 O fuso do agendamento é fixo em `America/Sao_Paulo`, independente do fuso do servidor.
 
@@ -138,7 +135,8 @@ EpicFreeToday/
 ├── bot.js              # bot do Telegram, agendamento e histórico
 ├── epicgamesbot.js     # consulta e interpretação da API da Epic
 ├── data/
-│   └── history.json    # histórico por dia (gerado automaticamente)
+│   ├── history.json     # histórico por dia (gerado automaticamente)
+│   └── subscribers.json # chats inscritos (gerado automaticamente)
 ├── .env.example        # modelo de configuração
 └── package.json
 ```
@@ -159,7 +157,7 @@ Comandos úteis: `pm2 logs epic-free`, `pm2 restart epic-free`, `pm2 stop epic-f
 ## ⚠️ Limitações
 
 - **Servidor desligado às 10:00:** se a máquina estiver fora do ar nesse horário, o envio do dia não acontece. Use `/hoje` para recuperar.
-- **Histórico local:** ele fica só em `data/history.json`. Faça backup dessa pasta se ele for importante para você.
+- **Dados locais:** o histórico e os inscritos ficam só em `data/`. Faça backup dessa pasta se eles forem importantes para você.
 - **Região fixa:** os preços e links vêm da loja brasileira (`pt-BR` / `BR`). Para outra região, altere `LOCALE` e `COUNTRY` no topo do [bot.js](bot.js).
 - **Sem recuperação de dias perdidos:** o histórico só registra os dias em que o bot rodou ou em que alguém usou `/hoje`.
 

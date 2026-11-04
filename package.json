@@ -10,9 +10,11 @@
   "scripts": {
     "start": "node bot.js",
     "dry": "node bot.js --once --dry",
-    "once": "node bot.js --once"
+    "once": "node bot.js --once",
+    "test": "node --test"
   },
   "dependencies": {
+    "fast-xml-parser": "^5.11.2",
     "node-cron": "^4.6.0"
   }
 }

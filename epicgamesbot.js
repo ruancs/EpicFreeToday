@@ -1,17 +1,15 @@
+import { fetchWithRetry } from './http.js';
+
 const ENDPOINT =
   'https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions';
 
 const STORE_BASE = 'https://store.epicgames.com';
-const MAX_ATTEMPTS = 3;
-const REQUEST_TIMEOUT_MS = 15_000;
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Busca o JSON que a própria página /free-games consome.
  * Mais estável (e barato) do que renderizar a página e fazer scraping de HTML.
  */
-export async function fetchPayload({ locale, country }) {
+export async function fetchPayload({ locale, country }, { log } = {}) {
   const url = new URL(ENDPOINT);
   url.search = new URLSearchParams({
     locale,
@@ -19,23 +17,8 @@ export async function fetchPayload({ locale, country }) {
     allowCountries: country,
   }).toString();
 
-  let lastError;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const res = await fetch(url, {
-        headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (error) {
-      lastError = error;
-      if (attempt < MAX_ATTEMPTS) await sleep(1000 * 2 ** attempt); // 2s, 4s
-    }
-  }
-  throw new Error(`Falha ao consultar a Epic: ${lastError.message}`, {
-    cause: lastError,
-  });
+  const res = await fetchWithRetry(url, { accept: 'application/json', log });
+  return res.json();
 }
 
 /**
@@ -74,11 +57,14 @@ function toGame(element, window, locale, status) {
     id: element.id,
     title: element.title,
     status, // 'current' | 'upcoming'
+    source: 'epic',
     image: pickImage(element.keyImages),
     url: buildUrl(element, locale),
     startDate: window.startDate,
     endDate: window.endDate,
+    endApprox: false,
     originalPrice: element.price?.totalPrice?.fmtPrice?.originalPrice ?? null,
+    requires: null,
   };
 }
 
@@ -134,7 +120,7 @@ export function parseFreeGames(payload, { now = new Date(), locale = 'pt-BR' } =
   };
 }
 
-export async function getFreeGames({ locale, country }) {
-  const payload = await fetchPayload({ locale, country });
+export async function getFreeGames({ locale, country }, { log } = {}) {
+  const payload = await fetchPayload({ locale, country }, { log });
   return parseFreeGames(payload, { locale });
 }

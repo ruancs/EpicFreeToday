@@ -1,7 +1,8 @@
 import cron from 'node-cron';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { getFreeGames } from './epicgamesbot.js';
+import { ALL_SOURCES, SOURCE_LABELS, getAllGames } from './games.js';
+import { DEFAULT_BASE_URL } from './lootscraper.js';
 
 try {
   process.loadEnvFile(join(import.meta.dirname, '.env'));
@@ -15,7 +16,13 @@ const CRON_SCHEDULE = process.env.CRON_SCHEDULE ?? '0 10 * * *';
 const HISTORY_FILE = process.env.HISTORY_FILE ?? join(import.meta.dirname, 'data', 'history.json');
 const SUBSCRIBERS_FILE =
   process.env.SUBSCRIBERS_FILE ?? join(import.meta.dirname, 'data', 'subscribers.json');
-const HOJE_CACHE_MS = 5 * 60 * 1000; // /hoje repetido não precisa bater na Epic toda vez
+const HOJE_CACHE_MS = 5 * 60 * 1000; // /hoje repetido não precisa bater nas fontes toda vez
+// SOURCES=epic,steam,amazon deixa desligar uma fonte sem mexer no código
+const SOURCES = (process.env.SOURCES ?? ALL_SOURCES.join(','))
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const LOOTSCRAPER_BASE_URL = process.env.LOOTSCRAPER_BASE_URL ?? DEFAULT_BASE_URL;
 const TZ = 'America/Sao_Paulo';
 const LOCALE = 'pt-BR';
 const COUNTRY = 'BR';
@@ -48,6 +55,10 @@ function fmtWhen(iso) {
 }
 
 const fmtDay = (key) => key.split('-').reverse().join('/');
+
+// Data aproximada (Amazon): o feed dá "2026-11-04 00:00" UTC, que é um palpite. Converter
+// para Brasília daria "03/11 21:00", uma precisão que não existe, então mostramos só o dia em UTC.
+const fmtApproxDay = (iso) => iso.slice(0, 10).split('-').reverse().join('/');
 
 /** Aceita: ontem | AAAA-MM-DD | DD/MM | DD/MM/AAAA. Devolve AAAA-MM-DD ou null. */
 function parseDayArg(arg) {
@@ -90,10 +101,13 @@ function updateJson(file, fallback, mutate) {
 const loadHistory = () => readJson(HISTORY_FILE, {});
 
 const saveDay = (key, games) =>
-  updateJson(HISTORY_FILE, {}, (history) => ({
-    ...history,
-    [key]: { fetchedAt: new Date().toISOString(), ...games },
-  }));
+  updateJson(HISTORY_FILE, {}, (history) => {
+    // Um resultado parcial (fonte fora do ar) não sobrescreve um registro mais completo do dia.
+    const previous = history[key];
+    const failed = (g) => g?.failedSources?.length ?? 0;
+    if (previous && failed(games) > failed(previous)) return history;
+    return { ...history, [key]: { fetchedAt: new Date().toISOString(), ...games } };
+  });
 
 // inscritos: lista de chat ids que recebem o envio diário
 const loadSubscribers = () => readJson(SUBSCRIBERS_FILE, []);
@@ -121,9 +135,16 @@ const todayCache = { key: null, at: 0, games: null };
 async function refreshToday({ maxAgeMs = 0 } = {}) {
   const key = dayKey();
   if (todayCache.key === key && Date.now() - todayCache.at < maxAgeMs) return todayCache.games;
-  const games = await getFreeGames({ locale: LOCALE, country: COUNTRY });
+  const games = await getAllGames({
+    sources: SOURCES,
+    locale: LOCALE,
+    country: COUNTRY,
+    lootscraperBaseUrl: LOOTSCRAPER_BASE_URL,
+    log,
+  });
   await saveDay(key, games);
-  Object.assign(todayCache, { key, at: Date.now(), games });
+  // resultado parcial não entra no cache: o próximo /hoje deve tentar de novo
+  if (games.failedSources.length === 0) Object.assign(todayCache, { key, at: Date.now(), games });
   return games;
 }
 
@@ -152,13 +173,24 @@ async function sendText(chatId, html, extra = {}) {
   });
 }
 
+const labelOf = (source) => SOURCE_LABELS[source ?? 'epic'] ?? source; // registros antigos não têm `source`
+
+function whenText(game) {
+  if (game.status === 'upcoming') return `grátis de ${fmtWhen(game.startDate)} até ${fmtWhen(game.endDate)}`;
+  if (!game.endDate) return 'grátis (sem data de término informada)';
+  if (game.endApprox) return `grátis até ~${fmtApproxDay(game.endDate)} (data aproximada)`;
+  return `grátis até ${fmtWhen(game.endDate)}`;
+}
+
 function caption(game) {
-  const when =
-    game.status === 'current'
-      ? `Grátis até ${fmtWhen(game.endDate)}`
-      : `Grátis de ${fmtWhen(game.startDate)} até ${fmtWhen(game.endDate)}`;
-  const price = game.originalPrice ? ` (de ${esc(game.originalPrice)})` : '';
-  return `<b>${esc(game.title)}</b>\n${when}${price}\n<a href="${esc(game.url)}">Abrir na Epic</a>`;
+  const label = labelOf(game.source);
+  // jogo free-to-play vem com preço "0": "(de 0)" não informa nada
+  const price = /[1-9]/.test(game.originalPrice ?? '') ? ` (de ${esc(game.originalPrice)})` : '';
+  const lines = [`<b>${esc(game.title)}</b>`, `${esc(label)} — ${whenText(game)}${price}`];
+  if (game.requires) lines.push(`Requer ${esc(game.requires)}`);
+  if (game.alsoIn?.length) lines.push(`Também em: ${game.alsoIn.map((s) => esc(labelOf(s))).join(', ')}`);
+  lines.push(`<a href="${esc(game.url)}">Abrir em ${esc(label)}</a>`);
+  return lines.join('\n');
 }
 
 async function sendGame(chatId, game) {
@@ -176,12 +208,17 @@ async function sendGame(chatId, game) {
 }
 
 async function sendDay(chatId, key, entry) {
-  const { current = [], upcoming = [] } = entry;
-  await sendText(chatId, `🎮 <b>Jogos grátis da Epic — ${fmtDay(key)}</b>`);
-  if (current.length === 0) await sendText(chatId, 'Nenhum jogo grátis neste dia.');
+  const { current = [], upcoming = [], failedSources = [] } = entry;
+  await sendText(chatId, `🎁 <b>Hora do grátis! — ${fmtDay(key)}</b>`);
+  if (failedSources.length > 0) {
+    // sem o aviso, um resumo sem jogos da Steam pareceria "não há nada hoje"
+    const names = failedSources.map((s) => esc(labelOf(s))).join(', ');
+    await sendText(chatId, `🙈 Não consegui falar com: ${names}. A lista pode estar incompleta, não me culpem.`);
+  }
+  if (current.length === 0) await sendText(chatId, '🦗 Nenhum jogo grátis neste dia. Só grilos por aqui.');
   for (const game of current) await sendGame(chatId, game);
   if (upcoming.length > 0) {
-    await sendText(chatId, '⏭ <b>Em breve</b>');
+    await sendText(chatId, '⏭ <b>Vem aí (anota na agenda)</b>');
     for (const game of upcoming) await sendGame(chatId, game);
   }
 }
@@ -211,35 +248,35 @@ async function dailyJob() {
     log(`OK: ${games.current.length} grátis agora, ${games.upcoming.length} em breve.`);
   } catch (error) {
     log('ERRO na verificação diária:', error);
-    await broadcast((chatId) => sendText(chatId, `⚠️ Não consegui consultar a Epic hoje: ${esc(error.message)}`));
+    await broadcast((chatId) => sendText(chatId, `💥 Tropecei ao consultar as lojas hoje: ${esc(error.message)}`));
   }
 }
 
 // ---------- comandos do bot ----------
 
 const HELP = [
-  '🎮 <b>Jogos grátis da Epic</b>',
-  'Eu mando os jogos grátis todo dia às 10:00 da manhã (Brasília).',
+  '🎮 <b>Caçador de jogos grátis</b>',
+  `Todo dia às 10:00 (Brasília) eu farejo ${SOURCES.map(labelOf).join(', ')} e te entrego o que está de graça.`,
   '',
-  '/stop — parar de receber o envio diário',
-  '/hoje — consulta a Epic agora',
-  '/historico — dias já registrados',
+  '/hoje — fareja as lojas agora mesmo',
+  '/historico — o que já achei nos outros dias',
   '/dia ontem — ou /dia 29/10, /dia 2026-10-29',
+  '/stop — pede para eu sumir (sem ressentimentos)',
 ].join('\n');
 
 async function showDay(chatId, key) {
   const history = await loadHistory();
-  if (!history[key]) return sendText(chatId, `Sem registro para ${fmtDay(key)}. Veja /historico.`);
+  if (!history[key]) return sendText(chatId, `📭 Não guardei nada de ${fmtDay(key)}. Dá uma olhada no /historico.`);
   return sendDay(chatId, key, history[key]);
 }
 
 async function showHistory(chatId) {
   const days = Object.keys(await loadHistory()).sort().reverse().slice(0, HISTORY_BUTTONS);
-  if (days.length === 0) return sendText(chatId, 'Ainda não há histórico. Use /hoje.');
+  if (days.length === 0) return sendText(chatId, '📭 Meu caderninho ainda está vazio. Manda um /hoje para eu começar a anotar.');
   const buttons = days.map((key) => ({ text: fmtDay(key).slice(0, 5), callback_data: `day:${key}` }));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 4) rows.push(buttons.slice(i, i + 4));
-  return sendText(chatId, '📅 Escolha um dia:', { reply_markup: { inline_keyboard: rows } });
+  return sendText(chatId, '📅 Escolha um dia (viagem no tempo, versão grátis):', { reply_markup: { inline_keyboard: rows } });
 }
 
 async function handleCommand(chatId, text, from) {
@@ -249,13 +286,26 @@ async function handleCommand(chatId, text, from) {
 
   switch (command) {
     case '/start': {
-      if (await subscribe(chatId)) log(`novo inscrito: ${chatId} (${from?.first_name ?? '?'})`);
-      return sendText(chatId, `✅ Inscrição feita! Você vai receber os jogos grátis todo dia às 10:00.\n\n${HELP}`);
+      if (!(await subscribe(chatId))) {
+        log(`/start de quem já está inscrito: ${chatId} (${from?.first_name ?? '?'})`);
+        return sendText(
+          chatId,
+          '😏 Calma, você já está na lista! Não esqueci de você.\n' +
+            'Os jogos grátis chegam todo dia às 10:00. Se a ansiedade bater, manda /hoje. /ajuda mostra o resto.',
+        );
+      }
+      log(`novo inscrito: ${chatId} (${from?.first_name ?? '?'})`);
+      return sendText(chatId, `🎉 Fechou, você está na lista! Todo dia às 10:00 eu apareço por aqui com os jogos grátis.\n\n${HELP}`);
     }
     case '/stop': {
       const removed = await unsubscribe(chatId);
       if (removed) log(`inscrição cancelada: ${chatId}`);
-      return sendText(chatId, removed ? 'Pronto, você não vai mais receber o envio diário. /start para voltar.' : 'Você não estava inscrito. /start para se inscrever.');
+      return sendText(
+        chatId,
+        removed
+          ? '😢 Ok, parei de te mandar mensagem. Vou ficar aqui sozinho, olhando as promoções... /start se mudar de ideia.'
+          : '🤔 Você nem estava na lista, não tenho o que cancelar. /start para entrar.',
+      );
     }
     case '/ajuda':
     case '/help':
@@ -268,11 +318,11 @@ async function handleCommand(chatId, text, from) {
       return showHistory(chatId);
     case '/dia': {
       const key = parseDayArg(arg);
-      if (!key) return sendText(chatId, 'Use: /dia ontem, /dia 29/10 ou /dia 2026-10-29');
+      if (!key) return sendText(chatId, '🤨 Essa data eu não entendi. Tenta: /dia ontem, /dia 29/10 ou /dia 2026-10-29');
       return showDay(chatId, key);
     }
     default:
-      return sendText(chatId, 'Não entendi. Veja /ajuda.');
+      return sendText(chatId, '🤷 Essa eu não sei fazer. Manda /ajuda que eu mostro o que sei.');
   }
 }
 
@@ -280,6 +330,7 @@ async function handleUpdate(update) {
   const callback = update.callback_query;
   const chatId = String(callback?.message?.chat.id ?? update.message?.chat.id ?? '');
   if (!chatId) return;
+  log(`recebido do chat ${chatId}: ${callback ? `botão ${callback.data}` : (update.message?.text ?? '(sem texto)')}`);
 
   try {
     if (callback) {
@@ -291,7 +342,7 @@ async function handleUpdate(update) {
     }
   } catch (error) {
     log('erro ao tratar update:', error.message);
-    await sendText(chatId, `⚠️ Deu erro: ${esc(error.message)}`).catch(() => {});
+    await sendText(chatId, `💥 Deu ruim: ${esc(error.message)}`).catch(() => {});
   }
 }
 
@@ -299,6 +350,7 @@ let running = true;
 
 async function pollUpdates() {
   let offset = 0;
+  let failures = 0;
   while (running) {
     try {
       const updates = await tg(
@@ -306,14 +358,20 @@ async function pollUpdates() {
         { offset, timeout: 30, allowed_updates: ['message', 'callback_query'] },
         45_000,
       );
+      failures = 0;
       for (const update of updates) {
         offset = update.update_id + 1;
         await handleUpdate(update);
       }
     } catch (error) {
       if (!running) break;
-      log('getUpdates falhou, tentando de novo em 5s:', error.message);
-      await sleep(5000);
+      failures++;
+      // "fetch failed" não diz nada; a causa real (ECONNRESET, ETIMEDOUT, ENOTFOUND...) fica em error.cause
+      const cause = error.cause?.code ?? error.cause?.message;
+      const waitMs = Math.min(1000 * 2 ** (failures - 1), 30_000); // 1s, 2s, 4s... até 30s
+      // uma queda isolada é normal (conexão ociosa derrubada pela rede); o contador mostra se persiste
+      log(`getUpdates falhou (${failures}x): ${error.message}${cause ? ` [${cause}]` : ''}. Nova tentativa em ${waitMs / 1000}s`);
+      await sleep(waitMs);
     }
   }
 }
@@ -323,6 +381,12 @@ async function pollUpdates() {
 async function main() {
   if (!TOKEN && !DRY) {
     console.error('Defina TELEGRAM_BOT_TOKEN no .env (ou use --dry para testar sem Telegram).');
+    process.exit(1);
+  }
+
+  const unknown = SOURCES.filter((s) => !ALL_SOURCES.includes(s));
+  if (unknown.length > 0 || SOURCES.length === 0) {
+    console.error(`SOURCES inválido (${unknown.join(', ') || 'vazio'}). Use: ${ALL_SOURCES.join(', ')}`);
     process.exit(1);
   }
 
@@ -346,7 +410,7 @@ async function main() {
     commands: [
       { command: 'start', description: 'Se inscrever no envio diário' },
       { command: 'stop', description: 'Cancelar o envio diário' },
-      { command: 'hoje', description: 'Consulta a Epic agora' },
+      { command: 'hoje', description: 'Consulta as lojas agora' },
       { command: 'historico', description: 'Dias já registrados' },
       { command: 'dia', description: 'Ver um dia: /dia ontem ou /dia 29/10' },
       { command: 'ajuda', description: 'Ajuda' },

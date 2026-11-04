@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎮 Epic Free Today
+# 🌽 Bot Catamilho Games
 
 **Um bot de Telegram que avisa todo dia, às 10:00, quais jogos estão de graça na Epic Games Store, na Steam e no Amazon Luna.**
 

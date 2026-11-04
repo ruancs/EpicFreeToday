@@ -1,7 +1,7 @@
 const MAX_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
 // Identifica o job: o feed do LootScraper é infraestrutura pessoal de terceiro.
-const USER_AGENT = 'EpicFreeToday/1.0 (bot pessoal; poucas requisicoes por dia)';
+const USER_AGENT = 'BotCatamilhoGames/1.0 (bot pessoal; poucas requisicoes por dia)';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

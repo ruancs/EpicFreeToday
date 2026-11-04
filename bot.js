@@ -255,13 +255,18 @@ async function dailyJob() {
 // ---------- comandos do bot ----------
 
 const HELP = [
-  '🎮 <b>Caçador de jogos grátis</b>',
+  '🎮 <b>O que eu sei fazer</b>',
   `Todo dia às 10:00 (Brasília) eu farejo ${SOURCES.map(labelOf).join(', ')} e te entrego o que está de graça.`,
   '',
   '/hoje — fareja as lojas agora mesmo',
   '/historico — o que já achei nos outros dias',
   '/dia ontem — ou /dia 29/10, /dia 2026-10-29',
   '/stop — pede para eu sumir (sem ressentimentos)',
+].join('\n');
+
+const WELCOME = [
+  '🌽 <b>Bem-vindo ao Bot Catamilho Games!</b>',
+  'Eu cato os jogos que estão de graça e te aviso antes que a promoção acabe. Você já está na lista: todo dia às 10:00 eu apareço por aqui.',
 ].join('\n');
 
 async function showDay(chatId, key) {
@@ -295,7 +300,7 @@ async function handleCommand(chatId, text, from) {
         );
       }
       log(`novo inscrito: ${chatId} (${from?.first_name ?? '?'})`);
-      return sendText(chatId, `🎉 Fechou, você está na lista! Todo dia às 10:00 eu apareço por aqui com os jogos grátis.\n\n${HELP}`);
+      return sendText(chatId, `${WELCOME}\n\n${HELP}`);
     }
     case '/stop': {
       const removed = await unsubscribe(chatId);
@@ -416,6 +421,15 @@ async function main() {
       { command: 'ajuda', description: 'Ajuda' },
     ],
   });
+
+  // texto mostrado na tela inicial do bot, antes do /start; é só enfeite, então uma falha não derruba o bot
+  const stores = SOURCES.map(labelOf).join(', ');
+  await tg('setMyDescription', {
+    description: `Bem-vindo ao Bot Catamilho Games! Todo dia às 10:00 eu aviso quais jogos estão de graça em: ${stores}. Mande /start para entrar na lista.`,
+  }).catch((error) => log('setMyDescription falhou:', error.message));
+  await tg('setMyShortDescription', {
+    short_description: `Cata os jogos grátis de ${stores} todo dia.`,
+  }).catch((error) => log('setMyShortDescription falhou:', error.message));
 
   cron.schedule(CRON_SCHEDULE, dailyJob, { timezone: TZ });
   const subscribers = await loadSubscribers();
